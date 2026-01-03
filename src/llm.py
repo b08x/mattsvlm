@@ -10,6 +10,7 @@ import openai # Added OpenAI client
 import math
 from src.utils import get_config
 from datetime import datetime
+from src import prompt_templates  # Fixed import
 
 # --- OpenAI Helper Function ---
 def format_openai_messages(context, batch_frames):
@@ -73,7 +74,7 @@ def prepare_batches(frames, batch_size=32):
     return [frames[i:i+batch_size] for i in range(0, len(frames), batch_size)]
 
 
-def process_frames(frames, prompt, batch_size=None, fps=8):
+def process_frames(frames, prompt, batch_size=None, fps=8, register=None):
     """
     Process frames with the VLM via the configured endpoint (Ollama or OpenAI).
     
@@ -82,6 +83,7 @@ def process_frames(frames, prompt, batch_size=None, fps=8):
         prompt (str): Text prompt for the VLM
         batch_size (int, optional): Number of frames per batch. If None, auto-calculated.
         fps (int, optional): Frames per second the video was sampled at. Defaults to 8.
+        register (str, optional): Technical register for prompt templates (e.g., 'it-workflow').
         
     Returns:
         str: Result from the VLM
@@ -95,6 +97,9 @@ def process_frames(frames, prompt, batch_size=None, fps=8):
     temperature = config["temperature"]
     top_p = config["top_p"]
     print(f"Using Temperature: {temperature}, Top P: {top_p}")
+    
+    if register:
+        print(f"Using technical register: {register}")
     
     client = None
     model = None
@@ -126,11 +131,8 @@ def process_frames(frames, prompt, batch_size=None, fps=8):
         raise ValueError(f"Invalid ENDPOINT_TYPE configured: {endpoint_type}")
 
     # Calculate optimal batch size if not provided or if endpoint is OpenAI
-    # Note: OpenAI might have different practical limits than Ollama for # images
     if batch_size is None or endpoint_type == 'openai': 
          # Recalculate for OpenAI or if not provided, maybe cap lower for OpenAI?
-         # For now, use the same logic, but keep in mind OpenAI's limits might differ.
-         # Consider a smaller max_batch_size specifically for OpenAI if needed.
         calculated_batch_size = calculate_optimal_batch_size(len(frames)) 
         if batch_size is not None:
             print(f"Overriding provided batch size {batch_size} with calculated {calculated_batch_size} for OpenAI or auto mode.")
@@ -141,41 +143,58 @@ def process_frames(frames, prompt, batch_size=None, fps=8):
     # --- Route to appropriate processing function ---
     if len(frames) <= batch_size:
         # Process all at once if possible (common case for short videos or large batches)
-        return process_all_frames_at_once(client, endpoint_type, model, frames, prompt, fps, temperature, top_p)
+        return process_all_frames_at_once(client, endpoint_type, model, frames, prompt, fps, temperature, top_p, register)
     else:
         # Process in batches if needed
-        return process_frames_in_batches(client, endpoint_type, model, frames, prompt, batch_size, fps, temperature, top_p)
+        return process_frames_in_batches(client, endpoint_type, model, frames, prompt, batch_size, fps, temperature, top_p, register)
 
 
-def process_all_frames_at_once(client, endpoint_type, model, frames, prompt, fps, temperature, top_p):
+def construct_system_prompt(prompt_text, len_frames, fps, register=None, is_batch=False, start_time=0.0, end_time=0.0):
+    """
+    Constructs the system prompt, optionally integrating the register templates.
+    """
+    base_context = ""
+    
+    if is_batch:
+        base_context = (
+            f"You are analyzing a sequence of {len_frames} consecutive frames, sampled at {fps} fps, "
+            f"representing video timestamps {start_time:.2f}s to {end_time:.2f}s. "
+        )
+    else:
+        base_context = (
+            f"You are analyzing a sequence of {len_frames} consecutive frames, sampled at {fps} fps. "
+            f"The frames are in chronological order, representing approximately {len_frames/fps:.2f} seconds of video. "
+            f"Since you're seeing all frames together, you have complete temporal context. "
+        )
+
+    if register:
+        # Use the template system
+        # We pass the user's manual prompt as 'context' to the template
+        # because the template asks "Analyze this segment... {context}"
+        template_prompt = prompt_templates.get_visual_topic_prompt(register, prompt_text)
+        
+        full_context = f"{base_context}\n\n{template_prompt}"
+    else:
+        # Standard default behavior
+        full_context = (
+            f"{base_context}"
+            f"Focus on identifying motion, changes, and key visual elements.\n"
+            f"You are not allowed to ask the user for more information, you are not allowed to hallucinate.\n\n"
+            f"The user wants you to: {prompt_text}"
+        )
+        
+    return full_context
+
+
+def process_all_frames_at_once(client, endpoint_type, model, frames, prompt, fps, temperature, top_p, register=None):
     """
     Process all frames in a single batch (Ollama or OpenAI).
-    
-    Args:
-        client: Initialized Ollama or OpenAI client
-        endpoint_type (str): "ollama" or "openai"
-        model (str): Model name
-        frames (list): List of base64-encoded image frames
-        prompt (str): Text prompt for the VLM
-        fps (int): Frames per second
-        temperature (float): Temperature for the VLM
-        top_p (float): Top P for the VLM
-        
-    Returns:
-        str: Result from the VLM
     """
     print(f"\n--- Processing all {len(frames)} frames in a single batch via {endpoint_type} ---")
     start_time = time.time()
     
     # --- Create Context ---
-    context = (
-        f"You are analyzing a video sequence of {len(frames)} consecutive frames, sampled at {fps} fps. "
-        f"The frames are in chronological order, representing approximately {len(frames)/fps:.2f} seconds of video. "
-        f"Since you're seeing all frames together, you have complete temporal context to analyze motion and changes. "
-        f"Focus on identifying motion and changes between frames, and analyze how objects/people move and interact over time. "
-        f"You are not allowed to ask the user for more information, you are not allowed to hallucinate, you are not allowed to make up information. "
-        f"\n\nThe user wants you to: {prompt}"
-    )
+    context = construct_system_prompt(prompt, len(frames), fps, register, is_batch=False)
     
     try:
         # --- Call API based on Endpoint Type ---
@@ -215,7 +234,6 @@ def process_all_frames_at_once(client, endpoint_type, model, frames, prompt, fps
             f"--- Performance Statistics ---\n"
             f"Total runtime: {duration:.2f} seconds\n"
             f"Frames processed: {len(frames)} in a single batch via {endpoint_type}\n"
-            # f"Time per frame: {duration/len(frames):.2f} seconds\n" # Less meaningful for batch
             f"Processing approach: Single batch (perfect temporal alignment)\n"
             f"Context window utilization: Full sequence analysis"
         )
@@ -229,24 +247,9 @@ def process_all_frames_at_once(client, endpoint_type, model, frames, prompt, fps
         raise ConnectionError(f"Failed to process frames via {endpoint_type}: {e}")
 
 
-# Renamed from process_frames_with_temporal_awareness for clarity
-def process_frames_in_batches(client, endpoint_type, model, frames, prompt, batch_size, fps, temperature, top_p): 
+def process_frames_in_batches(client, endpoint_type, model, frames, prompt, batch_size, fps, temperature, top_p, register=None): 
     """
     Process frames in multiple batches (Ollama or OpenAI) with temporal awareness.
-    
-    Args:
-        client: Initialized Ollama or OpenAI client
-        endpoint_type (str): "ollama" or "openai"
-        model (str): Model name
-        frames (list): List of base64-encoded image frames
-        prompt (str): Text prompt for the VLM
-        batch_size (int): Number of frames per batch
-        fps (int): Frames per second
-        temperature (float): Temperature for the VLM
-        top_p (float): Top P for the VLM
-        
-    Returns:
-        str: Result from the VLM
     """
     overall_start_time = time.time()
     batches = prepare_batches(frames, batch_size)
@@ -271,27 +274,20 @@ def process_frames_in_batches(client, endpoint_type, model, frames, prompt, batc
             print(f"Frames {batch_start_frame + 1}-{batch_end_frame + 1} (time: {start_time_sec:.2f}s-{end_time_sec:.2f}s)")
             
             # --- Create Context for the current batch ---
-            context = (
-                f"You are analyzing a sequence of {len(batch)} consecutive frames ({batch_start_frame + 1} to {batch_end_frame + 1}) "
-                f"from a video sampled at {fps} fps, representing video timestamps {start_time_sec:.2f}s to {end_time_sec:.2f}s. "
-                f"Focus on identifying motion and temporal changes *within this specific segment*. "
-                f"Use bounding boxes or other visual features to identify the location of the characters in the video sequence to help with the analysis. "
-                f"DO NOT GUESS OR HALLUCINATE. SIMPLY REPORT WHAT YOU SEE. ONLY REPORT WHAT YOU SEE IN THE FRAMES."
+            context = construct_system_prompt(
+                prompt, len(batch), fps, register, 
+                is_batch=True, start_time=start_time_sec, end_time=end_time_sec
             )
             
             # --- Add context from previous batch (optional but helpful) ---
-            # Note: This increases token count, be mindful of limits, especially for OpenAI
             if previous_observations and i > 0:
                  # Calculate previous segment time for clarity
                  prev_start_frame = (i-1) * batch_size
-                 prev_end_frame = prev_start_frame + batch_size - 1 # Assuming full previous batch
+                 prev_end_frame = prev_start_frame + batch_size - 1 
                  prev_start_sec = prev_start_frame / fps
                  prev_end_sec = prev_end_frame / fps
                  context += (f"\n\nObservations from the immediately preceding segment "
                              f"(Time {prev_start_sec:.2f}s-{prev_end_sec:.2f}s): {previous_observations}\n\n")
-
-            # Add the main user prompt
-            context += f"The user wants you to analyze this current segment ({start_time_sec:.2f}s-{end_time_sec:.2f}s) based on this prompt: {prompt}"
 
             # --- Call API based on Endpoint Type ---
             batch_response_text = ""
@@ -321,7 +317,6 @@ def process_frames_in_batches(client, endpoint_type, model, frames, prompt, batc
 
             if not batch_response_text:
                  print(f"Warning: API call to {endpoint_type} for batch {i+1} returned an empty response.")
-                 # Decide how to handle: skip, use placeholder, or raise error? For now, use placeholder.
                  batch_response_text = "(No response from API for this segment)"
 
             responses.append(batch_response_text)
@@ -343,7 +338,6 @@ def process_frames_in_batches(client, endpoint_type, model, frames, prompt, batc
         except Exception as e:
             error_type = type(e).__name__
             print(f"Error during {endpoint_type} API call (batch {i+1}): {error_type} - {e}")
-            # Option: Allow continuing to next batch? Or raise immediately? Raising is safer.
             raise ConnectionError(f"Failed to process batch {i+1} via {endpoint_type}: {e}")
     
     # --- Generate Final Summary ---
@@ -360,13 +354,16 @@ def process_frames_in_batches(client, endpoint_type, model, frames, prompt, batc
         final_instruction = f"""Based *only* on the detailed observations provided above for each time segment, generate a final, comprehensive response to the user's prompt: '{prompt}'.
 
 Please structure your response as follows:
-1.  **Chronological Timeline:** Create a clear, structured timeline of events using the provided timestamps (e.g., "Time 0.0s - 3.1s:", "Time 3.2s - 6.3s:", etc.). Describe the key actions, movements, and changes occurring within each time segment based *only* on the segment summaries. Do NOT refer back to frame numbers.
-2.  **Key Event Highlights (Optional but encouraged):** If possible, identify and list 1-3 most significant events or transitions observed in the video, along with their approximate start times (e.g., "- X begins (~3.6s)").
-3.  **Overall Summary:** Briefly summarize the main narrative or activity depicted across the entire analyzed duration, synthesizing the timeline information.
-4. Character names may be supplied in the prompt, if so, use them in the response IF they exist and are seen in the video sequence ONLY.
+1.  **Chronological Timeline:** Create a clear, structured timeline of events using the provided timestamps.
+2.  **Key Event Highlights:** List 1-3 most significant events or transitions observed.
+3.  **Overall Summary:** Briefly summarize the main narrative or activity depicted.
 
-Focus on accurately reflecting the information from the segment summaries using the time references. Ensure the timeline flows logically based on the sequential observations. Adhere strictly to the observations provided in the segments above. This is NOT interactive, you are not allowed to ask the user for more information.
+Focus on accurately reflecting the information from the segment summaries using the time references.
 """
+        
+        # If register is active, add specific format instructions if needed
+        if register:
+            final_instruction += f"\nPlease ensure the final output respects the {register} domain context."
 
         final_context = f"""I have analyzed {len(frames)} sequential frames from a video sampled at {fps} fps, representing approximately {len(frames)/fps:.2f} seconds of video content via {endpoint_type}.
 
@@ -379,7 +376,6 @@ Here are my detailed observations from analyzing the video in {len(batches)} seg
         # --- Call Final Summary API ---
         final_result = ""
         if endpoint_type == "ollama":
-             # Ollama final summary doesn't need images
              final_response = client.generate(
                  model=model,
                  prompt=final_context,
@@ -391,7 +387,6 @@ Here are my detailed observations from analyzing the video in {len(batches)} seg
              )
              final_result = final_response.get("response", "")
         elif endpoint_type == "openai":
-             # OpenAI final summary also doesn't need images
              messages = [{"role": "user", "content": final_context}]
              final_response = client.chat.completions.create(
                  model=model,

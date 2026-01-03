@@ -4,6 +4,9 @@ Utility functions for the VLM pipeline.
 
 import os
 import sys
+import json
+import re
+from datetime import datetime
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -131,4 +134,80 @@ def validate_video_file(file_path):
     valid_extensions = ['.mp4', '.mov', '.avi', '.mkv']
     _, ext = os.path.splitext(file_path)
     
-    return ext.lower() in valid_extensions 
+    return ext.lower() in valid_extensions
+
+
+def extract_json_from_response(text):
+    """
+    Attempt to extract and parse a JSON object from a text response.
+    It looks for markdown code blocks (```json ... ```) first, 
+    then tries to find the first '{' and last '}' to parse.
+    If parsing fails, returns the original text.
+
+    Args:
+        text (str): The string response from the LLM.
+
+    Returns:
+        dict or str: The parsed JSON object or the original string.
+    """
+    text = text.strip()
+    
+    # Try to find JSON inside markdown code blocks
+    pattern = r"```json\s*(.*?)\s*```"
+    json_match = re.search(pattern, text, re.DOTALL)
+    
+    if json_match:
+        try:
+            return json.loads(json_match.group(1).strip())
+        except json.JSONDecodeError:
+            pass # Fall through to other methods
+
+    # Try to find the outermost braces
+    try:
+        start_index = text.find('{')
+        end_index = text.rfind('}')
+        if start_index != -1 and end_index != -1 and end_index > start_index:
+            possible_json = text[start_index : end_index + 1]
+            return json.loads(possible_json)
+    except json.JSONDecodeError:
+        pass
+        
+    # If all else fails, return original text
+    return text
+
+
+def update_process_log(log_file, entry_data):
+    """
+    Updates a JSON log file with a new entry.
+    Creates the file if it doesn't exist.
+
+    Args:
+        log_file (str): Path to the JSON log file.
+        entry_data (dict): The data to append.
+    """
+    logs = []
+    
+    # Check if file exists and load existing data
+    if os.path.exists(log_file):
+        try:
+            with open(log_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+                if content.strip():
+                    logs = json.loads(content)
+                    if not isinstance(logs, list):
+                        # If existing file is not a list, make it a list
+                        logs = [logs] 
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Warning: Could not read existing log file {log_file} ({e}). Creating a new one.")
+            logs = []
+
+    # Append new entry
+    logs.append(entry_data)
+
+    # Write back to file
+    try:
+        with open(log_file, 'w', encoding='utf-8') as f:
+            json.dump(logs, f, indent=2, ensure_ascii=False)
+        print(f"Successfully updated log file: {log_file}")
+    except IOError as e:
+        print(f"Error writing to log file {log_file}: {e}")
